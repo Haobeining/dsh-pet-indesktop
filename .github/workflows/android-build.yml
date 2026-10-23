@@ -1,0 +1,231 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'scripts/export_android_assets.py'
+      - 'pet/**'
+      - '.github/workflows/android-build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUNBUFFERED: "1"
+      # Gradle 的 exportPetAssets 用 Exec 启动 python3，子进程继承这个 PATH，
+      # 这样 pet/frameseq_provision.py 的 "from PySide6.QtCore import ..." 能命中 shim
+      PYTHONPATH: ${{ github.workspace }}/pyside6_shim
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc || true
+          df -h
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python deps (NO PySide6 - use shim)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "Pillow>=10.3" "imageio-ffmpeg>=0.6"
+          echo "--- installed ---"
+          python -c "import PIL, imageio_ffmpeg; print('Pillow', PIL.__version__); print('ffmpeg', imageio_ffmpeg.get_ffmpeg_exe())"
+
+      - name: Create PySide6 shim (only QtCore stubs used by CLI path)
+        run: |
+          mkdir -p pyside6_shim/PySide6
+          touch pyside6_shim/PySide6/__init__.py
+          cat > pyside6_shim/PySide6/QtCore.py << 'EOF'
+          """Minimal QtCore stub for headless CLI use.
+
+          pet/frameseq_provision.py imports QLockFile, QThread, Signal at module
+          level. The CLI export path (convert_clip) only uses pure Python +
+          ffmpeg + Pillow; QLockFile is used elsewhere. These stubs keep the
+          import working without installing the full PySide6/Qt stack.
+          """
+          import os
+
+
+          class Signal:
+              def __init__(self, *args, **kwargs):
+                  self._slots = []
+
+              def emit(self, *args, **kwargs):
+                  for fn in list(self._slots):
+                      try:
+                          fn(*args, **kwargs)
+                      except Exception:
+                          pass
+
+              def connect(self, fn):
+                  self._slots.append(fn)
+
+              def disconnect(self, fn=None):
+                  if fn is None:
+                      self._slots.clear()
+                  elif fn in self._slots:
+                      self._slots.remove(fn)
+
+
+          class QThread:
+              def __init__(self, *args, **kwargs):
+                  self._interrupt = False
+                  self._running = False
+
+              def start(self):
+                  self._running = True
+                  self.run()
+                  self._running = False
+
+              def run(self):
+                  pass
+
+              def isRunning(self):
+                  return self._running
+
+              def isInterruptionRequested(self):
+                  return self._interrupt
+
+              def requestInterruption(self):
+                  self._interrupt = True
+
+              def wait(self, *args):
+                  return True
+
+              def quit(self):
+                  self._interrupt = True
+
+
+          class QLockFile:
+              NoError = 0
+              LockFailedError = 1
+
+              def __init__(self, path):
+                  self.path = path
+                  self._fd = None
+
+              def setStaleLockTime(self, ms):
+                  pass
+
+              def tryLock(self, timeout=0):
+                  try:
+                      fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                      os.write(fd, str(os.getpid()).encode())
+                      self._fd = fd
+                      return True
+                  except FileExistsError:
+                      return False
+                  except OSError:
+                      return True
+
+              def lock(self):
+                  return self.tryLock()
+
+              def unlock(self):
+                  if self._fd is not None:
+                      try:
+                          os.close(self._fd)
+                      except Exception:
+                          pass
+                      self._fd = None
+                  try:
+                      os.unlink(self.path)
+                  except Exception:
+                      pass
+
+              def removeStaleLockFile(self):
+                  self.unlock()
+
+              def error(self):
+                  return 0
+
+              def isLocked(self):
+                  return self._fd is not None
+          EOF
+          echo "--- shim created ---"
+          PYTHONPATH="$PWD/pyside6_shim" python -c "
+          from PySide6.QtCore import QLockFile, QThread, Signal
+          print('shim OK: QLockFile, QThread, Signal')
+          "
+
+      - name: Verify shim + script args (no export yet)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/pyside6_shim
+        run: |
+          echo "=== PySide6 shim 自检 ==="
+          python3 -c "from PySide6.QtCore import QLockFile, QThread, Signal; print('shim OK')"
+          echo "=== 导出脚本帮助（确认 --output 参数） ==="
+          python3 scripts/export_android_assets.py --help
+          echo "=== 实际导出交给 Gradle 的 exportPetAssets 任务处理 ==="
+          grep -n 'CORE_GROUPS = ' scripts/export_android_assets.py
+
+      - name: Configure Gradle memory
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          org.gradle.parallel=true
+          org.gradle.workers.max=2
+          kotlin.daemon.jvmargs=-Xmx3g
+          EOF
+          cat ~/.gradle/gradle.properties
+
+      - name: Build Debug APK
+        working-directory: android
+        env:
+          PYTHONPATH: ${{ github.workspace }}/pyside6_shim
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug \
+            -PpetPython="$(which python3)" \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee build.log
+
+      - name: Print error summary on failure
+        if: failure()
+        working-directory: android
+        run: |
+          echo "::error::=== BUILD FAILED - key errors ==="
+          if [ -f build.log ]; then
+            grep -nE "(FAILURE:|What went wrong|Execution failed for task|^> |e: file://|error:|Exception|OutOfMemoryError|Traceback|ModuleNotFound)" -A 6 -B 2 build.log | tail -120 || tail -n 120 build.log
+          fi
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: android/build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-pet-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
